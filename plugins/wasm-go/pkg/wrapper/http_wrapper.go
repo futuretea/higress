@@ -83,11 +83,32 @@ func (c ClusterClient[C]) Call(method, rawURL string, headers [][2]string, body 
 
 func (c ClusterClient[C]) ClusterName() string { return c.cluster.ClusterName() }
 
+// parseDestinationToCluster converts a user-friendly destination string (e.g., "target-api.dns:443")
+// to an Envoy cluster name (e.g., "outbound|443||target-api.dns").
+// If the input is empty, it returns an empty string.
+// If no port is specified, defaults to port 80.
+func parseDestinationToCluster(destination string) string {
+	if destination == "" {
+		return ""
+	}
+	host := destination
+	port := "80"
+	if idx := strings.LastIndex(destination, ":"); idx > 0 {
+		host = destination[:idx]
+		port = destination[idx+1:]
+	}
+	return fmt.Sprintf("outbound|%s||%s", port, host)
+}
+
 func HttpCall(cluster Cluster, method, rawURL string, headers [][2]string, body []byte,
 	callback ResponseCallback, timeoutMillisecond ...uint32) error {
+	var targetClusterOverride string
 	for i := len(headers) - 1; i >= 0; i-- {
 		key := headers[i][0]
 		if key == ":method" || key == ":path" || key == ":authority" {
+			headers = append(headers[:i], headers[i+1:]...)
+		} else if key == "x-higress-destination" {
+			targetClusterOverride = headers[i][1]
 			headers = append(headers[:i], headers[i+1:]...)
 		}
 	}
@@ -109,9 +130,16 @@ func HttpCall(cluster Cluster, method, rawURL string, headers [][2]string, body 
 	if len(timeoutMillisecond) > 0 {
 		timeout = timeoutMillisecond[0]
 	}
+	clusterName := cluster.ClusterName()
+	if targetClusterOverride != "" {
+		overrideCluster := parseDestinationToCluster(targetClusterOverride)
+		proxywasm.LogDebugf("overriding cluster from '%s' to '%s' via x-higress-destination header (destination: %s)",
+			clusterName, overrideCluster, targetClusterOverride)
+		clusterName = overrideCluster
+	}
 	headers = append(headers, [2]string{":method", method}, [2]string{":path", path}, [2]string{":authority", authority})
 	requestID := uuid.New().String()
-	_, err = proxywasm.DispatchHttpCall(cluster.ClusterName(), headers, body, nil, timeout, func(numHeaders, bodySize, numTrailers int) {
+	_, err = proxywasm.DispatchHttpCall(clusterName, headers, body, nil, timeout, func(numHeaders, bodySize, numTrailers int) {
 		respBody, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
 		if err != nil {
 			proxywasm.LogCriticalf("failed to get response body: %v", err)
@@ -140,6 +168,6 @@ func HttpCall(cluster Cluster, method, rawURL string, headers [][2]string, body 
 		callback(code, headers, respBody)
 	})
 	proxywasm.LogDebugf("http call start, id: %s, cluster: %s, method: %s, url: %s, headers: %#v, body: %s, timeout: %d",
-		requestID, cluster.ClusterName(), method, rawURL, headers, body, timeout)
+		requestID, clusterName, method, rawURL, headers, body, timeout)
 	return err
 }
